@@ -5,11 +5,16 @@ import numpy as np
 import json
 import random
 import time
+import subprocess
+import textwrap
+import re
 from typing import TypedDict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 
 # --- SELENIUM IMPORTS ---
 from selenium import webdriver
@@ -21,7 +26,7 @@ from selenium.common.exceptions import NoSuchElementException
 load_dotenv()
 # os.environ["OPENAI_API_KEY"] = "sk-..." 
 DB_NAME = "towns_detailed.db"
-MAX_WORKERS = 5  # Adjust based on your RAM (each worker = 1 Chrome window)
+MAX_WORKERS = 5  # Adjust based on your RAM
 
 # --- 1. SETUP DATABASE ---
 def init_db():
@@ -71,8 +76,6 @@ def clean_value(text_value):
         return 0.0
 
 def search_city_selenium(city, country=""):    
-    # NOTE: This function is called by each thread independently.
-    # It creates its OWN driver instance, which is thread-safe.
     print(f"   [Worker] Starting scrape for {city}...")
     
     options = Options()
@@ -81,8 +84,6 @@ def search_city_selenium(city, country=""):
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument(f'user-agent={get_ua()}')
     options.page_load_strategy = 'eager'
-    
-    # Suppress logging
     options.add_argument("--log-level=3")
 
     city_url = city.replace(" ", "-").title()
@@ -173,7 +174,6 @@ def search_city_selenium(city, country=""):
         return None
 
 def save_to_db(data: dict):
-    """Writes a single record to DB. Must be called from Main Thread."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     try:
@@ -219,12 +219,12 @@ class AgentState(TypedDict):
     target_town: str
     target_town_data: dict
     final_dataset_names: List[str]
+    top_correlations: dict  # Stores the top 5 influential features
 
 def check_db_node(state: AgentState):
     town = state['target_town']
     print(f"--- Node 1: Checking DB for {town} ---")
     conn = sqlite3.connect(DB_NAME)
-    # Check if table exists first to avoid crash on fresh install
     try:
         df = pd.read_sql(f"SELECT * FROM towns WHERE name = '{town}'", conn)
     except Exception:
@@ -257,15 +257,12 @@ def find_neighbors_node(state: AgentState):
     
     print(f"--- Node 3: Parallel Search for neighbors safer than {target_index} ---")
     
-    # 1. Get List of Towns
     similar_towns = get_similar_towns_from_llm(target_name)
-    # Dedup and remove target
     similar_towns = [t for t in list(set(similar_towns)) if t != target_name]
     
     valid_towns = [target_name]
     towns_to_scrape = []
     
-    # 2. Check DB first (Fast sequential check)
     conn = sqlite3.connect(DB_NAME)
     for town in similar_towns:
         existing = pd.read_sql(f"SELECT * FROM towns WHERE name = '{town}'", conn)
@@ -278,53 +275,202 @@ def find_neighbors_node(state: AgentState):
             towns_to_scrape.append(town)
     conn.close()
     
-    # 3. Multithreaded Scraping for the rest
     if towns_to_scrape:
         print(f"   ...Spawning {len(towns_to_scrape)} threads for scraping...")
-        
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Map scraper to towns
             future_to_town = {executor.submit(search_city_selenium, town): town for town in towns_to_scrape}
             
             for future in as_completed(future_to_town):
                 town = future_to_town[future]
                 try:
-                    data = future.result() # This blocks until thread finishes
+                    data = future.result()
                     if data:
-                        # Logic: Add if Safety Index is HIGHER
                         if data['safety_index'] > target_index:
-                            save_to_db(data) # Write to DB in main thread (Safe)
+                            save_to_db(data)
                             valid_towns.append(town)
                 except Exception as exc:
                     print(f"   [Main] Thread exception for {town}: {exc}")
 
     return {"final_dataset_names": valid_towns}
 
+from xgboost import XGBRegressor  # add this at the top of the file with other imports
+
 def analysis_node(state: AgentState):
+    """Trains an XGBoost model and uses feature importance to find the top 5 features."""
     town_names = state['final_dataset_names']
-    print(f"--- Node 4: Analyzing {len(town_names)} towns ---")
+    print(f"--- Node 4: Analyzing {len(town_names)} towns with XGBoost ---")
     
     if len(town_names) < 3:
-        print("Not enough data for correlation.")
-        return
+        print("Not enough data for model-based feature importance.")
+        return {"top_correlations": {}}
 
     conn = sqlite3.connect(DB_NAME)
-    placeholders = ',' .join('?' for _ in town_names)
-    df = pd.read_sql(f"SELECT * FROM towns WHERE name IN ({placeholders})", conn, params=town_names)
-    conn.close()
+    placeholders = ','.join('?' for _ in town_names)
+    try:
+        df = pd.read_sql(
+            f"SELECT * FROM towns WHERE name IN ({placeholders})",
+            conn,
+            params=town_names
+        )
+    except Exception as e:
+        print(f"Error reading DB: {e}")
+        return {"top_correlations": {}}
+    finally:
+        conn.close()
     
     numeric_df = df.select_dtypes(include=[np.number])
-    if 'safety_index' not in numeric_df.columns: return
+    if 'safety_index' not in numeric_df.columns:
+        print("No safety_index column found in numeric data.")
+        return {"top_correlations": {}}
 
-    corr = numeric_df.corr()['safety_index'].drop('safety_index')
-    top_5 = corr.abs().sort_values(ascending=False).head(5)
+    # Prepare features (X) and target (y)
+    feature_cols = [c for c in numeric_df.columns if c != 'safety_index']
+    if not feature_cols:
+        print("No feature columns available for training.")
+        return {"top_correlations": {}}
+
+    X = numeric_df[feature_cols]
+    y = numeric_df['safety_index']
+
+    # Optional: handle missing values
+    X = X.dropna()       # remove rows with any NaNs
+    y = y.loc[X.index]   # keep only corresponding rows in y
+    y = y.dropna()       # remove any NaNs in y
+    X = X.loc[y.index]   # keep only corresponding rows in X
+
+    # Train XGBoost model
+    model = XGBRegressor(n_estimators=100, random_state=42)
+
+    try:
+        model.fit(X, y)
+    except Exception as e:
+        print(f"Error training XGBoost model: {e}")
+        return {"top_correlations": {}}
+
+    # Get feature importances from the trained model
+    importances = model.feature_importances_
+    importance_series = pd.Series(importances, index=feature_cols)
+
+    # Take top 5 most important features
+    top = importance_series.sort_values(ascending=False)
+
+    top = top[top > 0.1]  # Filter out zero importance features
+
+    print("\n   🌲 Top Influential Features (XGBoost importance):")
+    for feature, score in top.items():
+        print(f"   - {feature}: {score:.4f}")
+
+    # Keep the key name 'top_correlations' so the rest of the pipeline still works
+    # (it's now "importance", not correlation, but the downstream code doesn't care).
+    return {"top_correlations": top.to_dict()}
+
+
+def generate_pdf_report_node(state: AgentState):
+    """Generates LaTeX code via LLM and compiles it to PDF."""
+    town = state['target_town']
+    correlations = state['top_correlations']
     
-    print("\n" + "="*50)
-    print("📈 TOP 5 INFLUENTIAL FEATURES")
-    print("="*50)
-    for feature, score in top_5.items():
-        print(f"{feature: <30} | Correlation: {corr[feature]:.4f}")
-    print("="*50 + "\n")
+    print(f"--- Node 5: Generating PDF Report for {town} ---")
+    
+    if not correlations:
+        print("No correlations found to report on.")
+        return
+
+    # 1. Prepare Data
+    data_summary = "\n".join([f"- {feature}: {score:.4f} correlation" for feature, score in correlations.items()])
+
+    # 2. Prompt LLM
+    llm = ChatOpenAI(model="gpt-4.1", temperature=0)
+    
+    prompt = textwrap.dedent(f"""
+        You are an urban safety and policy expert.
+
+        I will give you:
+        1) The name of a town.
+        2) The x features that have the strongest correlation with its safety index.
+        3) A few numeric values for those features for the specific town.
+
+        You must produce a COMPLETE LaTeX document (from \\documentclass to \\end{{document}})
+        that can be compiled with pdflatex to a PDF report.
+
+        Requirements for the LaTeX document:
+        - Language: English.
+        - Title: "Safety Profile and Improvement Plan for {town}".
+        - Use the standard article class and only standard packages (no custom .sty files).
+        - Structure:
+            * Abstract (short summary of the town's safety situation).
+            * Section 1: Overview of the safety index and methodology
+              (explain that we used correlation between features and safety_index
+              for a set of similar or safer towns).
+            * Section 2: Detailed analysis of the 5 most influential features.
+              For each feature:
+                - Rename the feature in the title to be more user-friendly.
+                - Do NOT just copy the feature name directly.
+                - Explain what the feature means in practical terms.
+                - Explain what a higher/lower value typically represents.
+                - Interpret the sign and magnitude of its correlation with the safety index.
+                - Discuss what the current approximate value for {town} suggests.
+            * Section 3: Actionable recommendations.
+              For each of the 5 features, provide concrete, realistic policies or
+              interventions that local authorities or communities could implement
+              to improve safety and reduce risk.
+            * Section 4: Prioritized action plan.
+              Rank the n features by how impactful they might be to address first,
+              and give a short timeline (short-term, medium-term, long-term). Include main course of action
+              and expected outcomes. Focus on how to maximize safety improvements efficiently.
+              Define at least 3 solutions for each feature that can truly impact the problem presented.
+        - Use professional, formal language suitable for policymakers.
+        - Do NOT invent specific crime statistics or exact numbers for the town
+          that are not provided. Keep numbers qualitative (e.g. "relatively high", "moderate").
+        - Do NOT include any markdown fences or backticks in your answer.
+        - The output must be PURE LaTeX code, nothing else.
+
+        Town name:
+        {town}
+
+        Top x features (with correlations to safety_index):
+        {data_summary}
+    """)
+    
+    print("   ...Querying LLM for LaTeX code...")
+    response = llm.invoke(prompt)
+    latex_code = response.content
+
+    # 3. Clean Output
+    match = re.search(r'```latex(.*?)```', latex_code, re.DOTALL)
+    if match:
+        latex_code = match.group(1).strip()
+    else:
+        latex_code = latex_code.replace("```latex", "").replace("```", "")
+
+    # 4. Save .tex
+    filename_base = f"{town.replace(' ', '_')}_safety_report"
+    tex_filename = f"{filename_base}.tex"
+    pdf_filename = f"{filename_base}.pdf"
+
+    with open(tex_filename, "w", encoding="utf-8") as f:
+        f.write(latex_code)
+    
+    print(f"   ...Saved {tex_filename}")
+
+    # 5. Compile PDF
+    try:
+        print("   ...Compiling PDF (this requires pdflatex)...")
+        # Run twice for TOC/references
+        subprocess.run(["pdflatex", "-interaction=nonstopmode", tex_filename], check=True, stdout=subprocess.DEVNULL)
+        print(f"   ✅ Report generated successfully: {pdf_filename}")
+        
+        # Open PDF
+        if os.name == 'nt': 
+            os.startfile(pdf_filename)
+        elif os.name == 'posix': 
+            subprocess.call(('open', pdf_filename))
+
+    except FileNotFoundError:
+        print("   ❌ Error: 'pdflatex' command not found. Please install MiKTeX or TeX Live.")
+        print("   The .tex file was saved, so you can compile it manually on Overleaf.")
+    except subprocess.CalledProcessError:
+        print("   ❌ Error during LaTeX compilation. Check the .log file.")
 
 # --- 5. BUILD GRAPH ---
 
@@ -338,18 +484,20 @@ workflow.add_node("check_db", check_db_node)
 workflow.add_node("scrape_target", scrape_target_node)
 workflow.add_node("find_neighbors", find_neighbors_node)
 workflow.add_node("analyze", analysis_node)
+workflow.add_node("generate_report", generate_pdf_report_node)
 
 workflow.set_entry_point("check_db")
 workflow.add_conditional_edges("check_db", decide_route, {"scrape_target": "scrape_target", "find_neighbors": "find_neighbors"})
 workflow.add_edge("scrape_target", "find_neighbors")
 workflow.add_edge("find_neighbors", "analyze")
-workflow.add_edge("analyze", END)
+workflow.add_edge("analyze", "generate_report")
+workflow.add_edge("generate_report", END)
 
 app = workflow.compile()
 
 if __name__ == "__main__":
     print("Initializing Database...")
-    init_db()  # Ensures tables exist
+    init_db()
     
     town_input = input("Enter a town name: ")
     print(f"🚀 Starting Parallel Agent for: {town_input}")
