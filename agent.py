@@ -453,11 +453,18 @@ def generate_pdf_report_node(state: AgentState):
     
     print(f"   ...Saved {tex_filename}")
 
-    # 5. Compile PDF
     try:
-        print("   ...Compiling PDF (this requires pdflatex)...")
-        # Run twice for TOC/references
-        subprocess.run(["pdflatex", "-interaction=nonstopmode", tex_filename], check=True, stdout=subprocess.DEVNULL)
+        # 🛑 UPDATED PATH BELOW 🛑
+        pdflatex_path = r"C:\texlive\2025\bin\windows\pdflatex.exe"
+        
+        print(f"   ...Compiling PDF using: {pdflatex_path}")
+        
+        # Run pdflatex using the direct path
+        subprocess.run(
+            [pdflatex_path, "-interaction=nonstopmode", tex_filename], 
+            check=True, 
+            stdout=subprocess.DEVNULL
+        )
         print(f"   ✅ Report generated successfully: {pdf_filename}")
         
         # Open PDF
@@ -467,10 +474,10 @@ def generate_pdf_report_node(state: AgentState):
             subprocess.call(('open', pdf_filename))
 
     except FileNotFoundError:
-        print("   ❌ Error: 'pdflatex' command not found. Please install MiKTeX or TeX Live.")
-        print("   The .tex file was saved, so you can compile it manually on Overleaf.")
+        print(f"   ❌ Error: The system could not find the file at: {pdflatex_path}")
+        print("   Please check if the version year (2025) or path is correct.")
     except subprocess.CalledProcessError:
-        print("   ❌ Error during LaTeX compilation. Check the .log file.")
+        print("   ❌ Error during LaTeX compilation. Check the .log file created in the folder.")
 
 # --- 5. BUILD GRAPH ---
 
