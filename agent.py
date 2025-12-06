@@ -383,54 +383,78 @@ def generate_pdf_report_node(state: AgentState):
     llm = ChatOpenAI(model="gpt-4.1", temperature=0)
     
     prompt = textwrap.dedent(f"""
-        You are an urban safety and policy expert.
+        You will be given:
+        1. The name of a town.
+        2. The top features with the highest feature importance in predicting its safety index.
+        3. Approximate numeric values for those features for that specific town.
 
-        I will give you:
-        1) The name of a town.
-        2) The x features that have the strongest correlation with its safety index.
-        3) A few numeric values for those features for the specific town.
+        Your task is to produce a COMPLETE LaTeX document, from \\documentclass to \\end{{document}}, which can be compiled with pdflatex into a PDF report.
 
-        You must produce a COMPLETE LaTeX document (from \\documentclass to \\end{{document}})
-        that can be compiled with pdflatex to a PDF report.
-
-        Requirements for the LaTeX document:
+        GENERAL REQUIREMENTS
         - Language: English.
         - Title: "Safety Profile and Improvement Plan for {town}".
-        - Use the standard article class and only standard packages (no custom .sty files).
-        - Structure:
-            * Abstract (short summary of the town's safety situation).
-            * Section 1: Overview of the safety index and methodology
-              (explain that we used correlation between features and safety_index
-              for a set of similar or safer towns).
-            * Section 2: Detailed analysis of the 5 most influential features.
-              For each feature:
-                - Rename the feature in the title to be more user-friendly.
-                - Do NOT just copy the feature name directly.
-                - Explain what the feature means in practical terms.
-                - Explain what a higher/lower value typically represents.
-                - Interpret the sign and magnitude of its correlation with the safety index.
-                - Discuss what the current approximate value for {town} suggests.
-            * Section 3: Actionable recommendations.
-              For each of the 5 features, provide concrete, realistic policies or
-              interventions that local authorities or communities could implement
-              to improve safety and reduce risk.
-            * Section 4: Prioritized action plan.
-              Rank the n features by how impactful they might be to address first,
-              and give a short timeline (short-term, medium-term, long-term). Include main course of action
-              and expected outcomes. Focus on how to maximize safety improvements efficiently.
-              Define at least 3 solutions for each feature that can truly impact the problem presented.
-        - Use professional, formal language suitable for policymakers.
-        - Do NOT invent specific crime statistics or exact numbers for the town
-          that are not provided. Keep numbers qualitative (e.g. "relatively high", "moderate").
-        - Do NOT include any markdown fences or backticks in your answer.
-        - The output must be PURE LaTeX code, nothing else.
+        - Use the standard article class and only standard LaTeX packages (no custom .sty files).
+        - The output MUST be pure LaTeX: no Markdown fences, no backticks, no extra commentary outside the LaTeX.
+        - Do NOT invent specific crime statistics or exact numeric values for the town that are not provided. Use only qualitative descriptions (e.g. "relatively high", "moderate", "low").
 
-        Town name:
+        DOCUMENT STRUCTURE
+
+        Abstract:
+        - Provide a concise, professional summary of the town’s current safety situation, based on the provided features and their feature importance in predicting the safety index.
+
+        Section 1: Overview of the safety index and methodology
+        - Explain what the safety index conceptually represents.
+        - Describe that the analysis is based on a predictive model of the safety index and the associated feature importance scores derived from a dataset of similar or safer towns.
+        - Clarify that the goal is to understand how the town compares and to identify targeted strategies to improve safety.
+
+        Section 2: Detailed analysis of the most influential features
+        - Focus on all the provided features (x in total), which are those with the highest feature importance scores with respect to the safety index.
+        - For each of the provided features:
+            * Provide a user-friendly, human-readable title. Do NOT simply repeat the raw feature name.
+            * Explain what the feature represents in practical, everyday terms for residents and policymakers.
+            * Explain what higher and lower values of this feature typically indicate in terms of urban conditions, risks, or protections.
+            * Interpret the magnitude of its feature importance:
+                - Explain what it means for this feature to be more or less influential in predicting the safety index compared with the other features.
+                - If directional information about its relationship to safety is available in the description (e.g. higher values tend to be associated with safer or less safe conditions), incorporate that qualitatively. Otherwise, remain non-committal about direction and focus on its influence.
+            * Discuss what the approximate current value for {town} suggests about its safety situation, using only qualitative descriptions (e.g. "relatively elevated compared to typical towns", "moderate level", "low level").
+            * Do NOT introduce any new numerical data not provided in the input.
+
+        Section 3: Actionable recommendations
+        - For each of the provided features:
+            * Propose concrete, realistic policies or interventions that local authorities or communities could implement to influence that feature in a way that improves safety.
+            * Recommendations must be specific and actionable (e.g. "expand targeted street lighting in high-traffic pedestrian corridors", "increase community-based patrols around transit hubs", "implement traffic-calming measures on specific categories of roads").
+            * Avoid vague or generic advice; focus on interventions that plausibly affect the underlying feature and, through it, the safety index.
+
+        Section 4: Prioritized action plan
+        - Rank all the provided features by how impactful they are likely to be if addressed, taking into account:
+            * The strength of their feature importance in the predictive model of the safety index.
+            * Feasibility and cost of interventions.
+            * Expected speed of impact.
+        - For each feature in priority order:
+            * State its priority (e.g. highest, high, medium).
+            * Assign a timeline classification: short-term, medium-term, or long-term.
+            * Describe the main course of action: what should be done first, and why.
+            * Define at least 3 concrete solutions or initiatives for that feature that can meaningfully impact the problem presented.
+            * Summarize the expected outcomes in qualitative terms (e.g. "reduced perception of disorder", "lower risk of nighttime victimization", "improved traffic safety in residential areas"), without inventing specific statistical impacts.
+
+        STYLE AND TONE
+        - Use professional, formal language suitable for policymakers, urban planners, and public safety officials.
+        - Ensure the document is logically structured, with clear subsections and coherent narrative flow.
+        - Keep explanations accessible but not overly technical; definitions should be understandable to non-specialists.
+
+        OUTPUT FORMAT
+        - The final answer must be a complete LaTeX document, from \\documentclass to \\end{{document}}.
+        - Do NOT include any Markdown syntax or backticks in your answer.
+        - Output only the LaTeX code, nothing else.
+
+        INPUT VARIABLES (for your reference):
+        - Town name:
         {town}
 
-        Top x features (with correlations to safety_index):
+        - Top features (with feature importance scores for safety_index and approximate values for this town):
         {data_summary}
     """)
+
     
     print("   ...Querying LLM for LaTeX code...")
     response = llm.invoke(prompt)
