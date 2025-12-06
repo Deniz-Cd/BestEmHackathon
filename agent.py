@@ -93,12 +93,12 @@ def search_city_selenium(city, country=""):
     
     try:
         driver.get(f"https://www.numbeo.com/crime/in/{city_url}")
-        time.sleep(3) 
+        time.sleep(1) 
         
         if "Cannot find city" in driver.page_source:
             if country:
                 driver.get(f"https://www.numbeo.com/crime/in/{city_url}-{country_url}")
-                time.sleep(3)
+                time.sleep(1)
                 if "Cannot find city" not in driver.page_source:
                     found = True
         else:
@@ -156,7 +156,7 @@ def search_city_selenium(city, country=""):
 
         # Calculate Mean
         vals = list(scraped_data.values())
-        safety_index = sum(vals) / len(vals) if vals else 0.0
+        safety_index = (100 - (sum(vals) / len(vals))) if vals else 0.0
 
         final_packet = {
             "name": city,
