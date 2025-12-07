@@ -1,3 +1,5 @@
+MAP_AREA = None
+target_town = ""
 import streamlit as st
 import pydeck as pdk
 from geopy.geocoders import Nominatim
@@ -9,7 +11,7 @@ import time
 import os
 import subprocess
 import re
-import random
+import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypedDict, List
 from dotenv import load_dotenv
@@ -26,7 +28,7 @@ from selenium.webdriver.common.by import By
 st.set_page_config(layout="wide", page_title="SafeCity Agent")
 load_dotenv()
 DB_NAME = "towns_detailed.db"
-MAX_WORKERS = 5
+MAX_WORKERS = 1
 
 # --- GEOCODING HELPER ---
 @st.cache_data
@@ -170,7 +172,9 @@ def get_similar_towns_from_llm(town_name: str):
     try:
         print(f"   🤖 [LLM] Asking GPT-4o for neighbors of {town_name}...")
         llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        prompt = (f"Find 30 similar towns to {town_name} regarding culture and safety. "
+        prompt = (f"Find 50 similar towns to {town_name} regarding culture, religion and laws. "
+                  "Take into consideration their population size and geographic location. "
+                    "Remove diacritical marks from names. "
                   "Return ONLY a raw comma-separated list of strings. Example: 'Paris, Lyon'.")
         response = llm.invoke(prompt)
         towns = [t.strip() for t in response.content.split(',')]
@@ -184,7 +188,7 @@ class AgentState(TypedDict):
     target_town_data: dict
     final_dataset_names: List[str]
     top_correlations: dict
-    map_data: List[dict] 
+    map_data: List[dict]
 
 def check_db_node(state: AgentState):
     town = state['target_town']
@@ -253,6 +257,13 @@ def find_neighbors_node(state: AgentState):
                         "name": town, "lat": coords['lat'], "lon": coords['lon'], 
                         "type": "neighbor", "safety": t_data['safety_index']
                     })
+                    # Update map immediately on each cache hit
+                    try:
+                        if MAP_AREA is not None:
+                            with MAP_AREA:
+                                render_map(map_update)
+                    except Exception:
+                        pass
             else:
                 print(f"   💾 [Cache Hit] {town} is NOT safer ({t_data['safety_index']})")
         else:
@@ -276,6 +287,13 @@ def find_neighbors_node(state: AgentState):
                                 "name": town, "lat": coords['lat'], "lon": coords['lon'], 
                                 "type": "neighbor", "safety": data['safety_index']
                             })
+                            # Update map immediately as each scrape completes
+                            try:
+                                if MAP_AREA is not None:
+                                    with MAP_AREA:
+                                        render_map(map_update)
+                            except Exception:
+                                pass
                 except: pass
 
     return {"final_dataset_names": valid_towns, "map_data": map_update}
@@ -300,35 +318,180 @@ def analysis_node(state: AgentState):
     model.fit(X, y)
     
     importance = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
-    top = importance[importance > 0.05]
     
-    print("   📊 Analysis Complete. Top features found.")
-    return {"top_correlations": top.to_dict()}
+    # Start with features above a small importance threshold
+    top = importance
+
+    # Compare target city's feature values vs mean of other cities; drop if target < mean
+    target_name = state['target_town']
+    try:
+        target_row = df[df['name'] == target_name].iloc[0]
+    except IndexError:
+        # If target row not found, skip filtering
+        print("   ⚠️ Target city row not found in dataset; skipping mean comparison filter.")
+        print("   📊 Analysis Complete. Top features found.")
+        return {"top_correlations": top.to_dict()}
+
+    neighbors_df = df[df['name'] != target_name]
+
+    filtered_features = []
+    for feature in top.index:
+        if feature in neighbors_df.columns and pd.notna(target_row.get(feature, np.nan)):
+            mean_val = neighbors_df[feature].mean()
+            target_val = target_row[feature]
+            # If target value is lower than mean, consider not important and drop'
+            print(f"   ... Comparing feature '{feature}': Target Value = {target_val}, Neighbors Mean = {mean_val}")
+            if pd.isna(mean_val) or target_val >= (mean_val + 10):
+                filtered_features.append(feature)
+        else:
+            # Keep feature if comparison cannot be made
+            filtered_features.append(feature)
+
+    filtered_top = top.loc[filtered_features]
+
+    print("   📊 Analysis Complete. Top features filtered by target vs mean.")
+    return {"top_correlations": filtered_top.to_dict()}
 
 def generate_pdf_report_node(state: AgentState):
+    """Generates LaTeX code via LLM and compiles it to PDF."""
     town = state['target_town']
     correlations = state['top_correlations']
-    print(f"\n--- 5. Generating Report for {town} ---")
-    if not correlations: return
+    
+    print(f"--- Node 5: Generating PDF Report for {town} ---")
+    
+    if not correlations:
+        print("No correlations found to report on.")
+        return
 
-    data_summary = "\n".join([f"- {k}: {v:.4f}" for k,v in correlations.items()])
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    prompt = f"""Generate LaTeX report for {town}. Top safety factors: \n{data_summary}. 
-    Return ONLY LaTeX code inside ```latex ... ```."""
+    # 1. Prepare Data
+    data_summary = "\n".join([f"- {feature}: {score:.4f} correlation" for feature, score in correlations.items()])
+
+    # 2. Prompt LLM
+    llm = ChatOpenAI(model="gpt-4.1", temperature=0)
     
+    prompt = textwrap.dedent(f"""
+        You will be given:
+        1. The name of a town.
+        2. The top features with the highest feature importance in predicting its safety index.
+        3. Approximate numeric values for those features for that specific town.
+
+        Your task is to produce a COMPLETE LaTeX document, from \\documentclass to \\end{{document}}, which can be compiled with pdflatex into a PDF report.
+
+        GENERAL REQUIREMENTS
+        - Language: English.
+        - Title: "Safety Profile and Improvement Plan for {town}".
+        - Use the standard article class and only standard LaTeX packages (no custom .sty files).
+        - The output MUST be pure LaTeX: no Markdown fences, no backticks, no extra commentary outside the LaTeX.
+        - Do NOT invent specific crime statistics or exact numeric values for the town that are not provided. Use only qualitative descriptions (e.g. "relatively high", "moderate", "low").
+
+        DOCUMENT STRUCTURE
+
+        Abstract:
+        - Provide a concise, professional summary of the town’s current safety situation, based on the provided features and their feature importance in predicting the safety index.
+
+        Section 1: Overview of the safety index and methodology
+        - Explain what the safety index conceptually represents.
+        - Describe that the analysis is based on a predictive model of the safety index and the associated feature importance scores derived from a dataset of similar or safer towns.
+        - Clarify that the goal is to understand how the town compares and to identify targeted strategies to improve safety.
+
+        Section 2: Detailed analysis of the most influential features
+        - Focus on all the provided features (x in total), which are those with the highest feature importance scores with respect to the safety index.
+        - For each of the provided features:
+            * Provide a user-friendly, human-readable title. Do NOT simply repeat the raw feature name.
+            * Explain what the feature represents in practical, everyday terms for residents and policymakers.
+            * Explain what higher and lower values of this feature typically indicate in terms of urban conditions, risks, or protections.
+            * Interpret the magnitude of its feature importance:
+                - Explain what it means for this feature to be more or less influential in predicting the safety index compared with the other features.
+                - If directional information about its relationship to safety is available in the description (e.g. higher values tend to be associated with safer or less safe conditions), incorporate that qualitatively. Otherwise, remain non-committal about direction and focus on its influence.
+            * Discuss what the approximate current value for {town} suggests about its safety situation, using only qualitative descriptions (e.g. "relatively elevated compared to typical towns", "moderate level", "low level").
+            * Do NOT introduce any new numerical data not provided in the input.
+
+        Section 3: Actionable recommendations
+        - For each of the provided features:
+            * Propose concrete, realistic policies or interventions that local authorities or communities could implement to influence that feature in a way that improves safety.
+            * Recommendations must be specific and actionable (e.g. "expand targeted street lighting in high-traffic pedestrian corridors", "increase community-based patrols around transit hubs", "implement traffic-calming measures on specific categories of roads").
+            * Avoid vague or generic advice; focus on interventions that plausibly affect the underlying feature and, through it, the safety index.
+
+        Section 4: Prioritized action plan
+        - Rank all the provided features by how impactful they are likely to be if addressed, taking into account:
+            * The strength of their feature importance in the predictive model of the safety index.
+            * Feasibility and cost of interventions.
+            * Expected speed of impact.
+        - For each feature in priority order:
+            * State its priority (e.g. highest, high, medium).
+            * Assign a timeline classification: short-term, medium-term, or long-term.
+            * Describe the main course of action: what should be done first, and why.
+            * Define at least 3 concrete solutions or initiatives for that feature that can meaningfully impact the problem presented.
+            * Summarize the expected outcomes in qualitative terms (e.g. "reduced perception of disorder", "lower risk of nighttime victimization", "improved traffic safety in residential areas"), without inventing specific statistical impacts.
+
+        STYLE AND TONE
+        - Use professional, formal language suitable for policymakers, urban planners, and public safety officials.
+        - Ensure the document is logically structured, with clear subsections and coherent narrative flow.
+        - Keep explanations accessible but not overly technical; definitions should be understandable to non-specialists.
+
+        OUTPUT FORMAT
+        - The final answer must be a complete LaTeX document, from \\documentclass to \\end{{document}}.
+        - Do NOT include any Markdown syntax or backticks in your answer.
+        - Output only the LaTeX code, nothing else.
+
+        INPUT VARIABLES (for your reference):
+        - Town name:
+        {town}
+
+        - Top features (with feature importance scores for safety_index and approximate values for this town):
+        - Categorize small importance values as still being relevant since they passed the filtering step.
+        - Treat them the same as important.
+        {data_summary}
+    """)
+
+    
+    print("   ...Querying LLM for LaTeX code...")
     response = llm.invoke(prompt)
-    latex_code = response.content.replace("```latex", "").replace("```", "").strip()
+    latex_code = response.content
+
+    # 3. Clean Output
+    match = re.search(r'```latex(.*?)```', latex_code, re.DOTALL)
+    if match:
+        latex_code = match.group(1).strip()
+    else:
+        latex_code = latex_code.replace("```latex", "").replace("```", "")
+
+    # 4. Save .tex
+    filename_base = f"{town.replace(' ', '_')}_safety_report"
+    tex_filename = f"{filename_base}.tex"
+    pdf_filename = f"{filename_base}.pdf"
+
+    with open(tex_filename, "w", encoding="utf-8") as f:
+        f.write(latex_code)
     
-    filename = f"{town}_report.tex"
-    with open(filename, "w", encoding="utf-8") as f: f.write(latex_code)
-    
+    print(f"   ...Saved {tex_filename}")
+
     try:
-        subprocess.run(["pdflatex", "-interaction=nonstopmode", filename], stdout=subprocess.DEVNULL)
-        print(f"   📄 PDF compiled: {filename.replace('.tex', '.pdf')}")
-    except: 
-        print("   ⚠️ Could not compile PDF (pdflatex missing or path error).")
-    
-    return
+        # 🛑 UPDATED PATH BELOW 🛑
+        pdflatex_path = r"C:\texlive\2025\bin\windows\pdflatex.exe"
+        
+        print(f"   ...Compiling PDF using: {pdflatex_path}")
+        
+        # Run pdflatex using the direct path
+        subprocess.run(
+            [pdflatex_path, "-interaction=nonstopmode", tex_filename], 
+            check=True, 
+            stdout=subprocess.DEVNULL
+        )
+        print(f"   ✅ Report generated successfully: {pdf_filename}")
+        
+        # Open PDF
+        if os.name == 'nt': 
+            os.startfile(pdf_filename)
+        elif os.name == 'posix': 
+            subprocess.call(('open', pdf_filename))
+
+    except FileNotFoundError:
+        print(f"   ❌ Error: The system could not find the file at: {pdflatex_path}")
+        print("   Please check if the version year (2025) or path is correct.")
+    except subprocess.CalledProcessError:
+        print("   ❌ Error during LaTeX compilation. Check the .log file created in the folder.")
+
 
 # --- GRAPH SETUP ---
 def decide_route(state: AgentState):
@@ -411,7 +574,8 @@ def main():
         status_area = st.empty()
         
     with col2:
-        map_area = st.empty()
+        global MAP_AREA
+        MAP_AREA = st.empty()
 
     if start_btn and town_input:
         inputs = {"target_town": town_input, "map_data": []}
@@ -423,7 +587,7 @@ def main():
             
             # --- Check if state is valid ---
             if current_state and "map_data" in current_state and current_state['map_data']:
-                with map_area:
+                with MAP_AREA:
                     render_map(current_state['map_data'])
 
             if node_name == "analyze" and current_state and "top_correlations" in current_state:
