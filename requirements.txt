@@ -1,0 +1,10 @@
+streamlit
+pydeck
+geopy
+pandas
+numpy
+python-dotenv
+langchain-openai
+langgraph
+xgboost
+selenium

@@ -173,6 +173,7 @@ def get_similar_towns_from_llm(town_name: str):
         print(f"   🤖 [LLM] Asking GPT-4o for neighbors of {town_name}...")
         llm = ChatOpenAI(model="gpt-4o", temperature=0)
         prompt = (f"Find 50 similar towns to {town_name} regarding culture, religion and laws. "
+                   "Make sure at least 20 of these towns are in different countries than the target town. "
                   "Take into consideration their population size and geographic location. "
                     "Remove diacritical marks from names. "
                   "Return ONLY a raw comma-separated list of strings. Example: 'Paris, Lyon'.")
